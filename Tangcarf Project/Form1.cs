@@ -1099,7 +1099,12 @@ namespace XmlToExcel
             if (string.IsNullOrWhiteSpace(token))
                 throw new InvalidOperationException("tsoft.txt içinde TOKEN bulunamadı.");
 
-            string url = dict.TryGetValue("URL", out var u) ? u : "http://tangcarf.tsoft.biz/rest1/subProduct/setSubProducts";
+            string url = dict.TryGetValue("URL", out var u) ? u : "https://tangcarf.tsoft.biz/rest1/subProduct/setSubProducts";
+            if (Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttp)
+            {
+                var ub = new UriBuilder(uri) { Scheme = Uri.UriSchemeHttps, Port = -1 };
+                url = ub.Uri.ToString();
+            }
             int timeout = 60;
             if (dict.TryGetValue("TIMEOUT_SECONDS", out var t) && int.TryParse(t, out int parsed))
                 timeout = Math.Max(10, parsed);
