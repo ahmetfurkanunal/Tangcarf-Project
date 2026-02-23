@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Globalization;
@@ -93,7 +93,7 @@ namespace XmlToExcel
         // ---------- Start/Stop ----------
         private async Task SendStocksToTSoftAsync(string trendyolExcelPath, CancellationToken ct)
         {
-            await SendVariantStocksToTSoftAsync(trendyolExcelPath);
+            await SendVariantStocksToTSoftAsync(trendyolExcelPath, ct);
         }
         private async Task StartAsync()
         {
@@ -367,7 +367,7 @@ namespace XmlToExcel
             // ----------- TSOFT POST EKLENDİ -----------
             try
             {
-                await SendVariantStocksToTSoftAsync(productsPath);
+                await SendVariantStocksToTSoftAsync(productsPath, ct);
             }
             catch (Exception ex)
 
@@ -1049,17 +1049,83 @@ namespace XmlToExcel
             return map;
         }
 
-        private async Task SendVariantStocksToTSoftAsync(string productsExcelPath)
+        private sealed class TSoftCfg
+        {
+            public string Url;
+            public string Token;
+            public int TimeoutSeconds = 60;
+        }
+
+        private sealed class TSoftResponse
+        {
+            public bool? success;
+            public List<TSoftMessage> message;
+        }
+
+        private sealed class TSoftMessage
+        {
+            public List<string> text;
+        }
+
+        private static TSoftCfg LoadTSoftConfig(string baseDir)
+        {
+            string path = Path.Combine(baseDir, "Parameters", "tsoft.txt");
+            if (!File.Exists(path))
+                throw new InvalidOperationException("tsoft.txt bulunamadı");
+
+            var lines = File.ReadAllLines(path, Encoding.UTF8)
+                .Select(l => l.Trim())
+                .Where(l => l.Length > 0 && !l.StartsWith("#") && !l.StartsWith("//"))
+                .ToList();
+
+            if (lines.Count == 0)
+                throw new InvalidOperationException("tsoft.txt boş.");
+
+            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var line in lines)
+            {
+                int idx = line.IndexOf('=');
+                if (idx <= 0 || idx >= line.Length - 1) continue;
+                string key = line.Substring(0, idx).Trim();
+                string val = line.Substring(idx + 1).Trim();
+                if (key.Length == 0 || val.Length == 0) continue;
+                dict[key] = val;
+            }
+
+            string token = dict.TryGetValue("TOKEN", out var tok) ? tok : null;
+            if (string.IsNullOrWhiteSpace(token) && lines.Count == 1 && !lines[0].Contains("="))
+                token = lines[0];
+
+            if (string.IsNullOrWhiteSpace(token))
+                throw new InvalidOperationException("tsoft.txt içinde TOKEN bulunamadı.");
+
+            string url = dict.TryGetValue("URL", out var u) ? u : "http://tangcarf.tsoft.biz/rest1/subProduct/setSubProducts";
+            int timeout = 60;
+            if (dict.TryGetValue("TIMEOUT_SECONDS", out var t) && int.TryParse(t, out int parsed))
+                timeout = Math.Max(10, parsed);
+
+            return new TSoftCfg { Url = url, Token = token, TimeoutSeconds = timeout };
+        }
+
+        private static string BuildTSoftError(TSoftResponse resp)
+        {
+            var texts = resp?.message?
+                .Where(m => m?.text != null)
+                .SelectMany(m => m.text)
+                .Where(t => !string.IsNullOrWhiteSpace(t))
+                .Select(t => t.Trim())
+                .Distinct()
+                .ToList();
+
+            return (texts != null && texts.Count > 0) ? string.Join(" | ", texts) : "Bilinmeyen TSoft hatası";
+        }
+
+        private async Task SendVariantStocksToTSoftAsync(string productsExcelPath, CancellationToken ct)
         {
             string baseDir = FindProjectRoot(AppDomain.CurrentDomain.BaseDirectory);
-            string tokenPath = Path.Combine(baseDir, "Parameters", "tsoft.txt");
+            var cfg = LoadTSoftConfig(baseDir);
 
-            if (!File.Exists(tokenPath))
-                throw new Exception("tsoft.txt bulunamadı");
-
-            string token = File.ReadAllText(tokenPath).Trim();
-
-            var items = new List<(string SubProductCode, int Stock)>();
+            var stockBySubProduct = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
             using (var wb = new XLWorkbook(productsExcelPath))
             {
@@ -1070,7 +1136,9 @@ namespace XmlToExcel
                 int colSku = 0;
                 int colStock = 0;
 
-                int lastCol = ws.Row(headerRow).LastCellUsed().Address.ColumnNumber;
+                int lastCol = ws.Row(headerRow).LastCellUsed()?.Address.ColumnNumber ?? 0;
+                if (lastCol == 0)
+                    throw new InvalidOperationException("Products Excel başlık satırı boş.");
 
                 for (int c = 1; c <= lastCol; c++)
                 {
@@ -1086,7 +1154,7 @@ namespace XmlToExcel
                 if (colSku == 0 || colStock == 0)
                     throw new Exception("Variant.Sku veya Variant.Stock.Total sütunu bulunamadı");
 
-                int lastRow = ws.LastRowUsed().RowNumber();
+                int lastRow = ws.LastRowUsed()?.RowNumber() ?? headerRow;
 
                 for (int r = headerRow + 1; r <= lastRow; r++)
                 {
@@ -1096,51 +1164,48 @@ namespace XmlToExcel
                         continue;
 
                     int stock = 0;
-                    int.TryParse(ws.Cell(r, colStock).GetString(), out stock);
+                    string sStock = ws.Cell(r, colStock).GetString().Trim();
+                    if (!int.TryParse(sStock, NumberStyles.Integer, CultureInfo.InvariantCulture, out stock))
+                        int.TryParse(Convert.ToString(ws.Cell(r, colStock).Value, CultureInfo.InvariantCulture), NumberStyles.Any, CultureInfo.InvariantCulture, out stock);
 
-                    items.Add((subCode, stock));
+                    stockBySubProduct[subCode] = Math.Max(0, stock);
                 }
             }
 
+            var items = stockBySubProduct
+                .Select(kv => new { SubProductCode = kv.Key, Stock = kv.Value.ToString(CultureInfo.InvariantCulture), IsActive = "1" })
+                .ToList();
+
             Log($"TSOFT gönderilecek ürün: {items.Count}");
 
-            // JSON oluştur
-            var sb = new StringBuilder();
-            sb.Append("[");
-
-            bool first = true;
-            foreach (var it in items)
-            {
-                if (!first) sb.Append(",");
-                first = false;
-
-                sb.Append("{");
-                sb.Append($"\"SubProductCode\":\"{it.SubProductCode}\",");
-                sb.Append($"\"Stock\":\"{it.Stock}\",");
-                sb.Append("\"IsActive\":\"1\"");
-                sb.Append("}");
-            }
-
-            sb.Append("]");
+            string dataJson = JsonConvert.SerializeObject(items);
 
             var content = new FormUrlEncodedContent(new[]
             {
-        new KeyValuePair<string,string>("token", token),
-        new KeyValuePair<string,string>("data", sb.ToString())
-    });
+                new KeyValuePair<string,string>("token", cfg.Token),
+                new KeyValuePair<string,string>("data", dataJson)
+            });
 
             using (var http = new HttpClient())
             {
+                http.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
                 var resp = await http.PostAsync(
-                    "http://tangcarf.tsoft.biz/rest1/subProduct/setSubProducts",
-                    content);
+                    cfg.Url,
+                    content,
+                    ct);
 
                 string body = await resp.Content.ReadAsStringAsync();
 
                 if (!resp.IsSuccessStatusCode)
-                    throw new Exception(body);
+                    throw new InvalidOperationException(body);
 
-                Log("🔥 TSOFT STOK GÜNCELLENDİ");
+                TSoftResponse parsed = null;
+                try { parsed = JsonConvert.DeserializeObject<TSoftResponse>(body); } catch { }
+
+                if (parsed != null && parsed.success.HasValue && !parsed.success.Value)
+                    throw new InvalidOperationException(BuildTSoftError(parsed));
+
+                Log("TSOFT stok güncelleme başarılı.");
             }
         }
 
