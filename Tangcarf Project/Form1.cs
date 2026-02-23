@@ -1067,6 +1067,14 @@ namespace XmlToExcel
             public List<string> text;
         }
 
+        private sealed class TSoftStockPayload
+        {
+            public string MainProductCode;
+            public string SubProductCode;
+            public string Stock;
+            public string IsActive;
+        }
+
         private static TSoftCfg LoadTSoftConfig(string baseDir)
         {
             string path = Path.Combine(baseDir, "Parameters", "tsoft.txt");
@@ -1130,7 +1138,9 @@ namespace XmlToExcel
             string baseDir = FindProjectRoot(AppDomain.CurrentDomain.BaseDirectory);
             var cfg = LoadTSoftConfig(baseDir);
 
-            var stockBySubProduct = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var stockByPair = new Dictionary<string, TSoftStockPayload>(StringComparer.OrdinalIgnoreCase);
+            int skippedMainCode = 0;
+            int skippedSubCode = 0;
 
             using (var wb = new XLWorkbook(productsExcelPath))
             {
@@ -1138,6 +1148,7 @@ namespace XmlToExcel
 
                 // 🔥 HEADER BUL
                 int headerRow = 1;
+                int colMain = 0;
                 int colSku = 0;
                 int colStock = 0;
 
@@ -1149,6 +1160,11 @@ namespace XmlToExcel
                 {
                     string h = ws.Cell(headerRow, c).GetString().Trim();
 
+                    if (h.Equals("Product.Id", StringComparison.OrdinalIgnoreCase) ||
+                        h.Equals("MainProductCode", StringComparison.OrdinalIgnoreCase) ||
+                        h.Equals("ProductCode", StringComparison.OrdinalIgnoreCase))
+                        colMain = c;
+
                     if (h.Equals("Variant.Sku", StringComparison.OrdinalIgnoreCase))
                         colSku = c;
 
@@ -1156,32 +1172,47 @@ namespace XmlToExcel
                         colStock = c;
                 }
 
-                if (colSku == 0 || colStock == 0)
-                    throw new Exception("Variant.Sku veya Variant.Stock.Total sütunu bulunamadı");
+                if (colMain == 0 || colSku == 0 || colStock == 0)
+                    throw new Exception("Product.Id(MainProductCode), Variant.Sku veya Variant.Stock.Total sütunu bulunamadı");
 
                 int lastRow = ws.LastRowUsed()?.RowNumber() ?? headerRow;
 
                 for (int r = headerRow + 1; r <= lastRow; r++)
                 {
+                    string mainCode = ws.Cell(r, colMain).GetString().Trim();
                     string subCode = ws.Cell(r, colSku).GetString().Trim();
 
-                    if (string.IsNullOrEmpty(subCode))
+                    if (string.IsNullOrEmpty(mainCode))
+                    {
+                        skippedMainCode++;
                         continue;
+                    }
+
+                    if (string.IsNullOrEmpty(subCode))
+                    {
+                        skippedSubCode++;
+                        continue;
+                    }
 
                     int stock = 0;
                     string sStock = ws.Cell(r, colStock).GetString().Trim();
                     if (!int.TryParse(sStock, NumberStyles.Integer, CultureInfo.InvariantCulture, out stock))
                         int.TryParse(Convert.ToString(ws.Cell(r, colStock).Value, CultureInfo.InvariantCulture), NumberStyles.Any, CultureInfo.InvariantCulture, out stock);
 
-                    stockBySubProduct[subCode] = Math.Max(0, stock);
+                    string key = mainCode + "||" + subCode;
+                    stockByPair[key] = new TSoftStockPayload
+                    {
+                        MainProductCode = mainCode,
+                        SubProductCode = subCode,
+                        Stock = Math.Max(0, stock).ToString(CultureInfo.InvariantCulture),
+                        IsActive = "1"
+                    };
                 }
             }
 
-            var items = stockBySubProduct
-                .Select(kv => new { SubProductCode = kv.Key, Stock = kv.Value.ToString(CultureInfo.InvariantCulture), IsActive = "1" })
-                .ToList();
+            var items = stockByPair.Values.ToList();
 
-            Log($"TSOFT gönderilecek ürün: {items.Count}");
+            Log($"TSOFT gönderilecek ürün: {items.Count} (MainProductCode boş atlanan: {skippedMainCode}, SubProductCode boş atlanan: {skippedSubCode})");
 
             string dataJson = JsonConvert.SerializeObject(items);
 
@@ -1261,6 +1292,7 @@ namespace XmlToExcel
 
             foreach (var r in rows)
             {
+                string productCode = GetVal(r, "Product.Id");
                 string sku = GetVal(r, "Variant.Sku");
                 int.TryParse(GetVal(r, "Variant.Stock.Total"), out int stock);
 
@@ -1276,7 +1308,7 @@ namespace XmlToExcel
                         continue; // eşleşmeyenleri gönderme
 
                     var dr = dt.NewRow();
-                    dr["ProductCode"] = sku;
+                    dr["ProductCode"] = string.IsNullOrWhiteSpace(productCode) ? sku : productCode;
                     dr["Barcode"] = tsoftBarcode; // 🔥 06 barkod
                     dr["Stock"] = stock;
 
