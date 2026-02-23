@@ -1079,29 +1079,46 @@ namespace XmlToExcel
 
         private static string NormalizeTSoftUrl(string rawUrl)
         {
-            var input = (rawUrl ?? "").Trim();
-            if (input.Length == 0) return DefaultTSoftSubProductUrl;
-
-            input = input.Trim('"', '\'').TrimEnd(';');
-            var m = Regex.Match(input, @"https?://[^\s""']+", RegexOptions.IgnoreCase);
-            var candidate = m.Success ? m.Value : input;
-
-            int q = candidate.IndexOf('?');
-            if (q >= 0) candidate = candidate.Substring(0, q);
-
-            if (!Uri.TryCreate(candidate, UriKind.Absolute, out var uri))
-                return DefaultTSoftSubProductUrl;
-
-            var ub = new UriBuilder(uri)
+            try
             {
-                Scheme = Uri.UriSchemeHttps,
-                Port = -1,
-                Query = "",
-                Fragment = ""
-            };
+                var input = (rawUrl ?? "").Trim();
+                if (input.Length == 0) return DefaultTSoftSubProductUrl;
 
-            var normalized = ub.Uri.GetLeftPart(UriPartial.Path).TrimEnd('/');
-            return normalized.Length <= 512 ? normalized : DefaultTSoftSubProductUrl;
+                input = input.Trim('"', '\'').TrimEnd(';');
+
+                // Eğer kullanıcı tüm request satırını yapıştırdıysa, endpoint'i içinden ayıkla.
+                var endpoint = Regex.Match(
+                    input,
+                    @"https?://[^/\s""']+/rest1/subProduct/setSubProducts",
+                    RegexOptions.IgnoreCase);
+                var anyUrl = Regex.Match(input, @"https?://[^\s""']+", RegexOptions.IgnoreCase);
+                var candidate = endpoint.Success
+                    ? endpoint.Value
+                    : (anyUrl.Success
+                        ? anyUrl.Value
+                        : input);
+
+                int q = candidate.IndexOf('?');
+                if (q >= 0) candidate = candidate.Substring(0, q);
+
+                if (!Uri.TryCreate(candidate, UriKind.Absolute, out var uri))
+                    return DefaultTSoftSubProductUrl;
+
+                var ub = new UriBuilder(uri)
+                {
+                    Scheme = Uri.UriSchemeHttps,
+                    Port = -1,
+                    Query = "",
+                    Fragment = ""
+                };
+
+                var normalized = ub.Uri.GetLeftPart(UriPartial.Path).TrimEnd('/');
+                return normalized.Length <= 512 ? normalized : DefaultTSoftSubProductUrl;
+            }
+            catch
+            {
+                return DefaultTSoftSubProductUrl;
+            }
         }
 
         private static TSoftCfg LoadTSoftConfig(string baseDir)
@@ -1162,6 +1179,7 @@ namespace XmlToExcel
         {
             string baseDir = FindProjectRoot(AppDomain.CurrentDomain.BaseDirectory);
             var cfg = LoadTSoftConfig(baseDir);
+            Log($"TSOFT endpoint: {cfg.Url}");
 
             var stockByPair = new Dictionary<string, TSoftStockPayload>(StringComparer.OrdinalIgnoreCase);
             int skippedMainCode = 0;
