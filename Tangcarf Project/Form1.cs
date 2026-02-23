@@ -1054,6 +1054,7 @@ namespace XmlToExcel
             public string Url;
             public string Token;
             public int TimeoutSeconds = 60;
+            public int BatchSize = 100;
         }
 
         private sealed class TSoftResponse
@@ -1158,8 +1159,11 @@ namespace XmlToExcel
             int timeout = 60;
             if (dict.TryGetValue("TIMEOUT_SECONDS", out var t) && int.TryParse(t, out int parsed))
                 timeout = Math.Max(10, parsed);
+            int batchSize = 100;
+            if (dict.TryGetValue("BATCH_SIZE", out var b) && int.TryParse(b, out int parsedBatch))
+                batchSize = Math.Max(1, Math.Min(500, parsedBatch));
 
-            return new TSoftCfg { Url = url, Token = token, TimeoutSeconds = timeout };
+            return new TSoftCfg { Url = url, Token = token, TimeoutSeconds = timeout, BatchSize = batchSize };
         }
 
         private static string BuildTSoftError(TSoftResponse resp)
@@ -1173,6 +1177,36 @@ namespace XmlToExcel
                 .ToList();
 
             return (texts != null && texts.Count > 0) ? string.Join(" | ", texts) : "Bilinmeyen TSoft hatası";
+        }
+
+        private static IEnumerable<List<TSoftStockPayload>> ChunkTSoftItems(List<TSoftStockPayload> src, int size)
+        {
+            if (size <= 0) size = 100;
+            for (int i = 0; i < src.Count; i += size)
+                yield return src.Skip(i).Take(Math.Min(size, src.Count - i)).ToList();
+        }
+
+        private async Task PostTSoftBatchAsync(HttpClient http, TSoftCfg cfg, List<TSoftStockPayload> batch, CancellationToken ct)
+        {
+            string dataJson = JsonConvert.SerializeObject(batch);
+            using (var content = new FormUrlEncodedContent(new[]
+            {
+                new KeyValuePair<string,string>("token", cfg.Token),
+                new KeyValuePair<string,string>("data", dataJson)
+            }))
+            using (var resp = await http.PostAsync(cfg.Url, content, ct))
+            {
+                string body = await resp.Content.ReadAsStringAsync();
+
+                if (!resp.IsSuccessStatusCode)
+                    throw new InvalidOperationException(body);
+
+                TSoftResponse parsed = null;
+                try { parsed = JsonConvert.DeserializeObject<TSoftResponse>(body); } catch { }
+
+                if (parsed != null && parsed.success.HasValue && !parsed.success.Value)
+                    throw new InvalidOperationException(BuildTSoftError(parsed));
+            }
         }
 
         private async Task SendVariantStocksToTSoftAsync(string productsExcelPath, CancellationToken ct)
@@ -1257,39 +1291,50 @@ namespace XmlToExcel
 
             Log($"TSOFT gönderilecek ürün: {items.Count} (MainProductCode boş atlanan: {skippedMainCode}, SubProductCode boş atlanan: {skippedSubCode})");
 
-            string dataJson = JsonConvert.SerializeObject(items);
-
-            var content = new FormUrlEncodedContent(new[]
+            if (items.Count == 0)
             {
-                new KeyValuePair<string,string>("token", cfg.Token),
-                new KeyValuePair<string,string>("data", dataJson)
-            });
+                Log("TSOFT gönderim atlandı: gönderilecek kayıt yok.");
+                return;
+            }
 
             using (var http = new HttpClient())
             {
                 http.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
-                HttpResponseMessage resp;
-                try
+                int total = items.Count;
+                int sent = 0;
+                int okBatch = 0;
+                int splitBatch = 0;
+                var queue = new Queue<List<TSoftStockPayload>>(ChunkTSoftItems(items, cfg.BatchSize));
+
+                while (queue.Count > 0)
                 {
-                    resp = await http.PostAsync(cfg.Url, content, ct);
+                    ct.ThrowIfCancellationRequested();
+                    var batch = queue.Dequeue();
+                    if (batch.Count == 0) continue;
+
+                    try
+                    {
+                        await PostTSoftBatchAsync(http, cfg, batch, ct);
+                        sent += batch.Count;
+                        okBatch++;
+                        Log($"TSOFT batch OK • adet: {batch.Count} • toplam: {sent}/{total}");
+                        await Task.Delay(150, ct);
+                    }
+                    catch (UriFormatException) when (batch.Count > 1)
+                    {
+                        int mid = batch.Count / 2;
+                        queue.Enqueue(batch.Take(mid).ToList());
+                        queue.Enqueue(batch.Skip(mid).ToList());
+                        splitBatch++;
+                        Log($"TSOFT batch bölündü (URI limit): {batch.Count} -> {mid}+{batch.Count - mid}");
+                    }
+                    catch (UriFormatException ex)
+                    {
+                        throw new InvalidOperationException("TSOFT payload URI encode limitine takıldı. BATCH_SIZE düşürün (örn: 25).", ex);
+                    }
                 }
-                catch (UriFormatException)
-                {
-                    throw new InvalidOperationException("tsoft.txt URL hatalı. Sadece endpoint yazın: https://.../rest1/subProduct/setSubProducts");
-                }
 
-                string body = await resp.Content.ReadAsStringAsync();
-
-                if (!resp.IsSuccessStatusCode)
-                    throw new InvalidOperationException(body);
-
-                TSoftResponse parsed = null;
-                try { parsed = JsonConvert.DeserializeObject<TSoftResponse>(body); } catch { }
-
-                if (parsed != null && parsed.success.HasValue && !parsed.success.Value)
-                    throw new InvalidOperationException(BuildTSoftError(parsed));
-
-                Log("TSOFT stok güncelleme başarılı.");
+                Log($"TSOFT stok güncelleme başarılı. Batch: {okBatch}, bölünen: {splitBatch}");
             }
         }
 
