@@ -1075,6 +1075,35 @@ namespace XmlToExcel
             public string IsActive;
         }
 
+        private const string DefaultTSoftSubProductUrl = "https://tangcarf.tsoft.biz/rest1/subProduct/setSubProducts";
+
+        private static string NormalizeTSoftUrl(string rawUrl)
+        {
+            var input = (rawUrl ?? "").Trim();
+            if (input.Length == 0) return DefaultTSoftSubProductUrl;
+
+            input = input.Trim('"', '\'').TrimEnd(';');
+            var m = Regex.Match(input, @"https?://[^\s""']+", RegexOptions.IgnoreCase);
+            var candidate = m.Success ? m.Value : input;
+
+            int q = candidate.IndexOf('?');
+            if (q >= 0) candidate = candidate.Substring(0, q);
+
+            if (!Uri.TryCreate(candidate, UriKind.Absolute, out var uri))
+                return DefaultTSoftSubProductUrl;
+
+            var ub = new UriBuilder(uri)
+            {
+                Scheme = Uri.UriSchemeHttps,
+                Port = -1,
+                Query = "",
+                Fragment = ""
+            };
+
+            var normalized = ub.Uri.GetLeftPart(UriPartial.Path).TrimEnd('/');
+            return normalized.Length <= 512 ? normalized : DefaultTSoftSubProductUrl;
+        }
+
         private static TSoftCfg LoadTSoftConfig(string baseDir)
         {
             string path = Path.Combine(baseDir, "Parameters", "tsoft.txt");
@@ -1107,12 +1136,8 @@ namespace XmlToExcel
             if (string.IsNullOrWhiteSpace(token))
                 throw new InvalidOperationException("tsoft.txt içinde TOKEN bulunamadı.");
 
-            string url = dict.TryGetValue("URL", out var u) ? u : "https://tangcarf.tsoft.biz/rest1/subProduct/setSubProducts";
-            if (Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttp)
-            {
-                var ub = new UriBuilder(uri) { Scheme = Uri.UriSchemeHttps, Port = -1 };
-                url = ub.Uri.ToString();
-            }
+            string rawUrl = dict.TryGetValue("URL", out var u) ? u : DefaultTSoftSubProductUrl;
+            string url = NormalizeTSoftUrl(rawUrl);
             int timeout = 60;
             if (dict.TryGetValue("TIMEOUT_SECONDS", out var t) && int.TryParse(t, out int parsed))
                 timeout = Math.Max(10, parsed);
@@ -1225,10 +1250,15 @@ namespace XmlToExcel
             using (var http = new HttpClient())
             {
                 http.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
-                var resp = await http.PostAsync(
-                    cfg.Url,
-                    content,
-                    ct);
+                HttpResponseMessage resp;
+                try
+                {
+                    resp = await http.PostAsync(cfg.Url, content, ct);
+                }
+                catch (UriFormatException)
+                {
+                    throw new InvalidOperationException("tsoft.txt URL hatalı. Sadece endpoint yazın: https://.../rest1/subProduct/setSubProducts");
+                }
 
                 string body = await resp.Content.ReadAsStringAsync();
 
