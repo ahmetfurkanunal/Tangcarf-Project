@@ -1,0 +1,1 @@
+{"extra":null,"success":false,"data":[],"message":[{"type":2,"code":"AUI006","index":0,"id":"","subid":"","text":["Token bulunamadı!"],"errorField":[]}],"summary":""}

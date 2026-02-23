@@ -1,0 +1,16 @@
+{
+  "items": [
+    {
+      "barcode": "8680000000001",
+      "quantity": 5,
+      "salePrice": 112.85,
+      "listPrice": 113.85
+    },
+    {
+      "barcode": "8680000000002",
+      "quantity": 10,
+      "salePrice": 89.90,
+      "listPrice": 99.90
+    }
+  ]
+}

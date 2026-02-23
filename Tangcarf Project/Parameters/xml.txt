@@ -1,0 +1,2 @@
+https://ikas-exporter-app.ikasapps.com/api/exports/b882417d-5085-461d-94ca-e4739404e853/bcfb6528-ca24-4935-8819-324494187fdb.xml?templateType=1&showCategoryPath=false&showTotalStockCount=false&imageExtensionJPEG=false&showDiscountPrice=false&showPriceInfo=false&separateCategories=false Parameters\seed.xml
+Products_ikas

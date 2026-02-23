@@ -1,0 +1,2 @@
+URL=http://tangcarf.tsoft.biz/rest1/subProduct/setSubProducts
+TOKEN=0fb652309d8230a6dc4ff1f55dfa2c81

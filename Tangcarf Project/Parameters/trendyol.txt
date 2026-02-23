@@ -1,0 +1,7 @@
+MODE=TRENDYOL_INTEGRATION
+SELLER_ID=675703
+API_KEY=UhSqEQFFnmzUMjLk7OJS
+API_SECRET=OQNEf4uysAmw2B6igunx
+USER_AGENT=675703 - XmlToExcelWinForms
+URL=https://apigw.trendyol.com/integration/inventory/sellers/{sellerId}/products/price-and-inventory
+TIMEOUT_SECONDS=60

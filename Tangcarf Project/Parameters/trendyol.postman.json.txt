@@ -1,0 +1,6 @@
+{
+  "baseUrl": "https://apigw.trendyol.com/integration/inventory/sellers/{sellerId}/products/price-and-inventory",
+  "sellerId": "675703",
+  "apiKey":   "UhSqEQFFnmzUMjLk7OJS",
+  "apiSecret":"OQNEf4uysAmw2B6igunx"
+}
