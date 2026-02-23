@@ -1068,6 +1068,19 @@ namespace XmlToExcel
             public List<string> text;
         }
 
+        private sealed class TSoftProductLite
+        {
+            public string ProductCode;
+            public string Barcode;
+        }
+
+        private sealed class TSoftProductsResponse
+        {
+            public bool? success;
+            public List<TSoftProductLite> data;
+            public List<TSoftMessage> message;
+        }
+
         private sealed class TSoftStockPayload
         {
             public string MainProductCode;
@@ -1179,6 +1192,94 @@ namespace XmlToExcel
             return (texts != null && texts.Count > 0) ? string.Join(" | ", texts) : "Bilinmeyen TSoft hatası";
         }
 
+        private static string BuildTSoftProductsUrl(string subProductUrl)
+        {
+            if (!Uri.TryCreate(subProductUrl ?? "", UriKind.Absolute, out var uri))
+                return "https://tangcarf.tsoft.biz/rest1/product/getProducts";
+            return $"{uri.Scheme}://{uri.Host}/rest1/product/getProducts";
+        }
+
+        private static Dictionary<string, string> LoadXmlToTSoftBarcodeMap(string baseDir)
+        {
+            var map = new Dictionary<string, string>(StringComparer.Ordinal);
+            string eslemePath = Path.Combine(baseDir, "Parameters", "esleme.xlsx");
+            if (!File.Exists(eslemePath))
+                return map;
+
+            using (var wb = new XLWorkbook(eslemePath))
+            {
+                var ws = wb.Worksheets.First();
+                FindEslemeHeaders(ws, out int h, out int colEan, out int colXml, out _);
+                if (colEan == 0 || colXml == 0)
+                    return map;
+
+                int last = ws.LastRowUsed()?.RowNumber() ?? h;
+                for (int r = h + 1; r <= last; r++)
+                {
+                    string tsoftBarcode = NormalizeBarcode(ws.Cell(r, colEan).GetString());
+                    string xmlBarcode = NormalizeBarcode(ws.Cell(r, colXml).GetString());
+                    if (xmlBarcode.Length > 0 && tsoftBarcode.Length > 0)
+                        map[xmlBarcode] = tsoftBarcode;
+                }
+            }
+
+            return map;
+        }
+
+        private static IEnumerable<string> SplitNormalizedBarcodes(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                yield break;
+
+            foreach (var part in raw.Split('|'))
+            {
+                var b = NormalizeBarcode(part);
+                if (b.Length > 0) yield return b;
+            }
+        }
+
+        private async Task<(Dictionary<string, string> MainCodeByBarcode, HashSet<string> MainCodes)>
+            LoadTSoftMainCodeIndexAsync(TSoftCfg cfg, CancellationToken ct)
+        {
+            var byBarcode = new Dictionary<string, string>(StringComparer.Ordinal);
+            var mainCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string url = BuildTSoftProductsUrl(cfg.Url);
+
+            using (var http = new HttpClient())
+            {
+                http.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
+                using (var content = new FormUrlEncodedContent(new[]
+                {
+                    new KeyValuePair<string,string>("token", cfg.Token),
+                    new KeyValuePair<string,string>("limit", "1000")
+                }))
+                using (var resp = await http.PostAsync(url, content, ct))
+                {
+                    string body = await resp.Content.ReadAsStringAsync();
+                    if (!resp.IsSuccessStatusCode)
+                        throw new InvalidOperationException("TSOFT ürün listesi alınamadı: " + body);
+
+                    var parsed = JsonConvert.DeserializeObject<TSoftProductsResponse>(body);
+                    if (parsed != null && parsed.success.HasValue && !parsed.success.Value)
+                    {
+                        var err = BuildTSoftError(new TSoftResponse { success = parsed.success, message = parsed.message });
+                        throw new InvalidOperationException("TSOFT ürün listesi hatası: " + err);
+                    }
+
+                    foreach (var p in parsed?.data ?? new List<TSoftProductLite>())
+                    {
+                        var main = (p?.ProductCode ?? "").Trim();
+                        var bar = NormalizeBarcode(p?.Barcode ?? "");
+                        if (main.Length == 0) continue;
+                        mainCodes.Add(main);
+                        if (bar.Length > 0) byBarcode[bar] = main;
+                    }
+                }
+            }
+
+            return (byBarcode, mainCodes);
+        }
+
         private static IEnumerable<List<TSoftStockPayload>> ChunkTSoftItems(List<TSoftStockPayload> src, int size)
         {
             if (size <= 0) size = 100;
@@ -1214,10 +1315,27 @@ namespace XmlToExcel
             string baseDir = FindProjectRoot(AppDomain.CurrentDomain.BaseDirectory);
             var cfg = LoadTSoftConfig(baseDir);
             Log($"TSOFT endpoint: {cfg.Url}");
+            var xmlToTsoftBarcode = LoadXmlToTSoftBarcodeMap(baseDir);
+
+            var mainByBarcode = new Dictionary<string, string>(StringComparer.Ordinal);
+            var validMainCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                var idx = await LoadTSoftMainCodeIndexAsync(cfg, ct);
+                mainByBarcode = idx.MainCodeByBarcode;
+                validMainCodes = idx.MainCodes;
+                Log($"TSOFT ürün index yüklendi: MainCode={validMainCodes.Count}, Barkod={mainByBarcode.Count}");
+            }
+            catch (Exception ex)
+            {
+                Log("TSOFT ürün index uyarı: " + ex.Message);
+            }
 
             var stockByPair = new Dictionary<string, TSoftStockPayload>(StringComparer.OrdinalIgnoreCase);
             int skippedMainCode = 0;
             int skippedSubCode = 0;
+            int mainResolvedByBarcode = 0;
+            int mainResolvedDirect = 0;
 
             using (var wb = new XLWorkbook(productsExcelPath))
             {
@@ -1228,6 +1346,7 @@ namespace XmlToExcel
                 int colMain = 0;
                 int colSku = 0;
                 int colStock = 0;
+                int colBarcodes = 0;
 
                 int lastCol = ws.Row(headerRow).LastCellUsed()?.Address.ColumnNumber ?? 0;
                 if (lastCol == 0)
@@ -1247,19 +1366,46 @@ namespace XmlToExcel
 
                     if (h.Equals("Variant.Stock.Total", StringComparison.OrdinalIgnoreCase))
                         colStock = c;
+                    if (h.Equals("Variant.Barcodes", StringComparison.OrdinalIgnoreCase))
+                        colBarcodes = c;
                 }
 
-                if (colMain == 0 || colSku == 0 || colStock == 0)
-                    throw new Exception("Product.Id(MainProductCode), Variant.Sku veya Variant.Stock.Total sütunu bulunamadı");
+                if (colSku == 0 || colStock == 0 || (colMain == 0 && colBarcodes == 0))
+                    throw new Exception("Variant.Sku, Variant.Stock.Total ve (Product.Id veya Variant.Barcodes) sütunları bulunamadı");
 
                 int lastRow = ws.LastRowUsed()?.RowNumber() ?? headerRow;
 
                 for (int r = headerRow + 1; r <= lastRow; r++)
                 {
-                    string mainCode = ws.Cell(r, colMain).GetString().Trim();
+                    string mainCode = colMain > 0 ? ws.Cell(r, colMain).GetString().Trim() : "";
                     string subCode = ws.Cell(r, colSku).GetString().Trim();
+                    string rawBarcodes = colBarcodes > 0 ? ws.Cell(r, colBarcodes).GetString() : "";
 
-                    if (string.IsNullOrEmpty(mainCode))
+                    string resolvedMainCode = "";
+                    if (mainCode.Length > 0)
+                    {
+                        if (validMainCodes.Count == 0 || validMainCodes.Contains(mainCode))
+                        {
+                            resolvedMainCode = mainCode;
+                            mainResolvedDirect++;
+                        }
+                    }
+
+                    if (resolvedMainCode.Length == 0)
+                    {
+                        foreach (var xmlBarcode in SplitNormalizedBarcodes(rawBarcodes))
+                        {
+                            var lookupBarcode = xmlToTsoftBarcode.TryGetValue(xmlBarcode, out var mapped) ? mapped : xmlBarcode;
+                            if (mainByBarcode.TryGetValue(lookupBarcode, out var mappedMain) && !string.IsNullOrWhiteSpace(mappedMain))
+                            {
+                                resolvedMainCode = mappedMain.Trim();
+                                mainResolvedByBarcode++;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (string.IsNullOrEmpty(resolvedMainCode))
                     {
                         skippedMainCode++;
                         continue;
@@ -1276,10 +1422,10 @@ namespace XmlToExcel
                     if (!int.TryParse(sStock, NumberStyles.Integer, CultureInfo.InvariantCulture, out stock))
                         int.TryParse(Convert.ToString(ws.Cell(r, colStock).Value, CultureInfo.InvariantCulture), NumberStyles.Any, CultureInfo.InvariantCulture, out stock);
 
-                    string key = mainCode + "||" + subCode;
+                    string key = resolvedMainCode + "||" + subCode;
                     stockByPair[key] = new TSoftStockPayload
                     {
-                        MainProductCode = mainCode,
+                        MainProductCode = resolvedMainCode,
                         SubProductCode = subCode,
                         Stock = Math.Max(0, stock).ToString(CultureInfo.InvariantCulture),
                         IsActive = "1"
@@ -1289,7 +1435,7 @@ namespace XmlToExcel
 
             var items = stockByPair.Values.ToList();
 
-            Log($"TSOFT gönderilecek ürün: {items.Count} (MainProductCode boş atlanan: {skippedMainCode}, SubProductCode boş atlanan: {skippedSubCode})");
+            Log($"TSOFT gönderilecek ürün: {items.Count} (MainProductCode çözülen: direkt={mainResolvedDirect}, barkod={mainResolvedByBarcode}, atlanan={skippedMainCode}; SubProductCode boş atlanan: {skippedSubCode})");
 
             if (items.Count == 0)
             {
