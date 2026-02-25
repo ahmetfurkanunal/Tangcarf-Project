@@ -91,9 +91,9 @@ namespace XmlToExcel
         }
 
         // ---------- Start/Stop ----------
-        private async Task SendStocksToTSoftAsync(string trendyolExcelPath, CancellationToken ct)
+        private async Task<int> SendStocksToTSoftAsync(string trendyolExcelPath, CancellationToken ct)
         {
-            await SendVariantStocksToTSoftAsync(trendyolExcelPath, ct);
+            return await SendVariantStocksToTSoftAsync(trendyolExcelPath, ct);
         }
         private async Task StartAsync()
         {
@@ -365,9 +365,10 @@ namespace XmlToExcel
             catch (Exception ex) { Log("Trendyol gönderim uyarı: " + ex.Message); }
 
             // ----------- TSOFT POST EKLENDİ -----------
+            int tsoftSent = 0;
             try
             {
-                await SendVariantStocksToTSoftAsync(productsPath, ct);
+                tsoftSent = await SendVariantStocksToTSoftAsync(productsPath, ct);
             }
             catch (Exception ex)
 
@@ -376,7 +377,7 @@ namespace XmlToExcel
             }
 
 
-            return (sent, $"Products:{dt.Rows.Count}, Trendyol gönderilen:{sent}");
+            return (sent, $"Products:{dt.Rows.Count}, Trendyol gönderilen:{sent}, TSoft gönderilen:{tsoftSent}");
         }
 
         // =============== XML yükleme + fallback ===============
@@ -1310,7 +1311,7 @@ namespace XmlToExcel
             }
         }
 
-        private async Task SendVariantStocksToTSoftAsync(string productsExcelPath, CancellationToken ct)
+        private async Task<int> SendVariantStocksToTSoftAsync(string productsExcelPath, CancellationToken ct)
         {
             string baseDir = FindProjectRoot(AppDomain.CurrentDomain.BaseDirectory);
             var cfg = LoadTSoftConfig(baseDir);
@@ -1440,14 +1441,14 @@ namespace XmlToExcel
             if (items.Count == 0)
             {
                 Log("TSOFT gönderim atlandı: gönderilecek kayıt yok.");
-                return;
+                return 0;
             }
 
+            int sent = 0;
             using (var http = new HttpClient())
             {
                 http.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
                 int total = items.Count;
-                int sent = 0;
                 int okBatch = 0;
                 int splitBatch = 0;
                 var queue = new Queue<List<TSoftStockPayload>>(ChunkTSoftItems(items, cfg.BatchSize));
@@ -1482,6 +1483,7 @@ namespace XmlToExcel
 
                 Log($"TSOFT stok güncelleme başarılı. Batch: {okBatch}, bölünen: {splitBatch}");
             }
+            return sent;
         }
 
 
