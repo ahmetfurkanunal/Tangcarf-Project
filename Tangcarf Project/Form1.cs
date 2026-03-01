@@ -15,6 +15,7 @@ using System.Windows.Forms;
 using System.Xml.Linq;
 using ClosedXML.Excel;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using WinTimer = System.Windows.Forms.Timer;
 // ClosedXML ile System.Xml.Linq LoadOptions çakışmasın:
 using XLoadOptions = System.Xml.Linq.LoadOptions;
@@ -1054,6 +1055,12 @@ namespace XmlToExcel
         {
             public string Url;
             public string Token;
+            public string ConfigPath;
+            public string AuthUser;
+            public string AuthPass;
+            public string AuthUrl;
+            public DateTime? TokenCreatedAtUtc;
+            public double RefreshBeforeHours = 23;
             public int TimeoutSeconds = 60;
             public int BatchSize = 100;
         }
@@ -1066,6 +1073,7 @@ namespace XmlToExcel
 
         private sealed class TSoftMessage
         {
+            public string code;
             public List<string> text;
         }
 
@@ -1176,8 +1184,44 @@ namespace XmlToExcel
             int batchSize = 100;
             if (dict.TryGetValue("BATCH_SIZE", out var b) && int.TryParse(b, out int parsedBatch))
                 batchSize = Math.Max(1, Math.Min(500, parsedBatch));
+            string authUser =
+                (dict.TryGetValue("AUTH_USER", out var au) ? au :
+                dict.TryGetValue("USERNAME", out var un) ? un :
+                dict.TryGetValue("USER", out var us) ? us : "")?.Trim();
+            string authPass =
+                (dict.TryGetValue("AUTH_PASS", out var ap) ? ap :
+                dict.TryGetValue("PASSWORD", out var pw) ? pw :
+                dict.TryGetValue("PASS", out var ps) ? ps : "")?.Trim();
+            string authUrl = (dict.TryGetValue("AUTH_URL", out var aurl) ? aurl : "").Trim();
 
-            return new TSoftCfg { Url = url, Token = token, TimeoutSeconds = timeout, BatchSize = batchSize };
+            DateTime parsedTokenTime;
+            DateTime? tokenCreatedAtUtc = null;
+            if (dict.TryGetValue("TOKEN_CREATED_AT_UTC", out var ts) &&
+                DateTime.TryParse(ts, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out parsedTokenTime))
+            {
+                tokenCreatedAtUtc = parsedTokenTime.ToUniversalTime();
+            }
+
+            double refreshBefore = 23;
+            if (dict.TryGetValue("TOKEN_REFRESH_BEFORE_HOURS", out var rh) &&
+                double.TryParse(rh, NumberStyles.Any, CultureInfo.InvariantCulture, out var parsedHours))
+            {
+                refreshBefore = Math.Max(1, Math.Min(23.5, parsedHours));
+            }
+
+            return new TSoftCfg
+            {
+                ConfigPath = path,
+                Url = url,
+                Token = token,
+                AuthUser = authUser,
+                AuthPass = authPass,
+                AuthUrl = authUrl,
+                TokenCreatedAtUtc = tokenCreatedAtUtc,
+                RefreshBeforeHours = refreshBefore,
+                TimeoutSeconds = timeout,
+                BatchSize = batchSize
+            };
         }
 
         private static string BuildTSoftError(TSoftResponse resp)
@@ -1191,6 +1235,256 @@ namespace XmlToExcel
                 .ToList();
 
             return (texts != null && texts.Count > 0) ? string.Join(" | ", texts) : "Bilinmeyen TSoft hatası";
+        }
+
+        private static bool IsTSoftTokenExpired(TSoftResponse resp, string rawBody = null)
+        {
+            if (resp?.message != null)
+            {
+                foreach (var m in resp.message)
+                {
+                    if (string.Equals(m?.code, "AUI009", StringComparison.OrdinalIgnoreCase))
+                        return true;
+
+                    foreach (var txt in m?.text ?? new List<string>())
+                    {
+                        var t = (txt ?? "").ToLowerInvariant();
+                        if (t.Contains("token") && (t.Contains("zaman") || t.Contains("expire") || t.Contains("bulunamad")))
+                            return true;
+                    }
+                }
+            }
+
+            var body = (rawBody ?? "").ToLowerInvariant();
+            if (body.Contains("aui009")) return true;
+            if (body.Contains("token") && (body.Contains("zaman") || body.Contains("expire") || body.Contains("bulunamad")))
+                return true;
+
+            return false;
+        }
+
+        private static bool HasTSoftAuthCredentials(TSoftCfg cfg) =>
+            !string.IsNullOrWhiteSpace(cfg?.AuthUser) && !string.IsNullOrWhiteSpace(cfg?.AuthPass);
+
+        private static bool LooksLikeToken(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return false;
+            s = s.Trim();
+            if (s.Length < 20 || s.Length > 256) return false;
+            if (s.Any(char.IsWhiteSpace)) return false;
+            return Regex.IsMatch(s, @"^[A-Za-z0-9\-_\.]+$");
+        }
+
+        private static string FindTokenInJson(JToken token)
+        {
+            if (token == null) return null;
+
+            if (token.Type == JTokenType.Object)
+            {
+                foreach (var p in ((JObject)token).Properties())
+                {
+                    var key = p.Name ?? "";
+                    var isTokenField =
+                        key.Equals("token", StringComparison.OrdinalIgnoreCase) ||
+                        key.Equals("authToken", StringComparison.OrdinalIgnoreCase) ||
+                        key.Equals("access_token", StringComparison.OrdinalIgnoreCase) ||
+                        key.Equals("accessToken", StringComparison.OrdinalIgnoreCase);
+
+                    if (isTokenField && p.Value.Type == JTokenType.String)
+                    {
+                        var val = (p.Value.Value<string>() ?? "").Trim();
+                        if (LooksLikeToken(val)) return val;
+                    }
+
+                    var nested = FindTokenInJson(p.Value);
+                    if (!string.IsNullOrWhiteSpace(nested)) return nested;
+                }
+            }
+            else if (token.Type == JTokenType.Array)
+            {
+                foreach (var item in token.Children())
+                {
+                    var nested = FindTokenInJson(item);
+                    if (!string.IsNullOrWhiteSpace(nested)) return nested;
+                }
+            }
+            else if (token.Type == JTokenType.String)
+            {
+                var val = (token.Value<string>() ?? "").Trim();
+                if (LooksLikeToken(val)) return val;
+            }
+
+            return null;
+        }
+
+        private static string ExtractTSoftTokenFromBody(string body)
+        {
+            if (string.IsNullOrWhiteSpace(body)) return null;
+
+            try
+            {
+                var root = JToken.Parse(body);
+                var token = FindTokenInJson(root);
+                if (!string.IsNullOrWhiteSpace(token)) return token;
+            }
+            catch { }
+
+            var m = Regex.Match(body, @"(?<![A-Za-z0-9])[a-fA-F0-9]{24,64}(?![A-Za-z0-9])");
+            return m.Success ? m.Value : null;
+        }
+
+        private static string BuildTSoftAuthLoginUrl(TSoftCfg cfg)
+        {
+            string raw = (cfg?.AuthUrl ?? "").Trim();
+
+            if (raw.Length == 0)
+            {
+                if (Uri.TryCreate(cfg?.Url ?? "", UriKind.Absolute, out var uri))
+                    raw = $"{uri.Scheme}://{uri.Host}/rest1/auth/login/{{user}}";
+                else
+                    raw = "https://tangcarf.tsoft.biz/rest1/auth/login/{user}";
+            }
+
+            raw = raw.Trim('"', '\'').TrimEnd(';');
+            var anyUrl = Regex.Match(raw, @"https?://[^\s""']+", RegexOptions.IgnoreCase);
+            var candidate = anyUrl.Success ? anyUrl.Value : raw;
+
+            int q = candidate.IndexOf('?');
+            if (q >= 0) candidate = candidate.Substring(0, q);
+
+            if (Uri.TryCreate(candidate, UriKind.Absolute, out var abs))
+            {
+                var ub = new UriBuilder(abs) { Scheme = Uri.UriSchemeHttps, Port = -1, Query = "", Fragment = "" };
+                candidate = ub.Uri.GetLeftPart(UriPartial.Path).TrimEnd('/');
+            }
+            else
+            {
+                candidate = "https://tangcarf.tsoft.biz/rest1/auth/login/{user}";
+            }
+
+            var userEsc = Uri.EscapeDataString((cfg?.AuthUser ?? "").Trim());
+            if (candidate.IndexOf("{user}", StringComparison.OrdinalIgnoreCase) >= 0)
+                return Regex.Replace(candidate, "\\{user\\}", userEsc, RegexOptions.IgnoreCase);
+
+            if (candidate.EndsWith("/auth/login", StringComparison.OrdinalIgnoreCase))
+                return candidate + "/" + userEsc;
+
+            if (candidate.IndexOf("/auth/login/", StringComparison.OrdinalIgnoreCase) >= 0)
+                return candidate;
+
+            return candidate.TrimEnd('/') + "/auth/login/" + userEsc;
+        }
+
+        private static void UpsertConfigLine(List<string> lines, string key, string value)
+        {
+            for (int i = 0; i < lines.Count; i++)
+            {
+                var line = lines[i] ?? "";
+                var trimmed = line.Trim();
+                if (trimmed.Length == 0 || trimmed.StartsWith("#") || trimmed.StartsWith("//")) continue;
+
+                int idx = trimmed.IndexOf('=');
+                if (idx <= 0) continue;
+
+                var k = trimmed.Substring(0, idx).Trim();
+                if (!k.Equals(key, StringComparison.OrdinalIgnoreCase)) continue;
+
+                lines[i] = $"{key}={value}";
+                return;
+            }
+
+            lines.Add($"{key}={value}");
+        }
+
+        private static void PersistTSoftToken(TSoftCfg cfg, string token)
+        {
+            cfg.Token = token;
+            cfg.TokenCreatedAtUtc = DateTime.UtcNow;
+
+            if (string.IsNullOrWhiteSpace(cfg?.ConfigPath))
+                return;
+
+            try
+            {
+                var lines = File.Exists(cfg.ConfigPath)
+                    ? File.ReadAllLines(cfg.ConfigPath, Encoding.UTF8).ToList()
+                    : new List<string>();
+
+                UpsertConfigLine(lines, "TOKEN", token);
+                UpsertConfigLine(lines, "TOKEN_CREATED_AT_UTC", DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture));
+                File.WriteAllLines(cfg.ConfigPath, lines, new UTF8Encoding(true));
+            }
+            catch { }
+        }
+
+        private async Task<bool> TryRefreshTSoftTokenAsync(TSoftCfg cfg, CancellationToken ct, string reason)
+        {
+            if (!HasTSoftAuthCredentials(cfg))
+            {
+                Log($"TSOFT token yenileme atlandı ({reason}): AUTH_USER/AUTH_PASS eksik.");
+                return false;
+            }
+
+            string loginUrl = BuildTSoftAuthLoginUrl(cfg);
+            string lastErr = "";
+
+            var payloads = new List<Dictionary<string, string>>
+            {
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { { "pass", cfg.AuthPass } },
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { { "password", cfg.AuthPass } },
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { { "sifre", cfg.AuthPass } },
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { { "pwd", cfg.AuthPass } },
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { { "data", cfg.AuthPass } }
+            };
+
+            using (var http = new HttpClient())
+            {
+                http.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
+
+                foreach (var form in payloads)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    try
+                    {
+                        using (var content = new FormUrlEncodedContent(form))
+                        using (var resp = await http.PostAsync(loginUrl, content, ct))
+                        {
+                            string body = await resp.Content.ReadAsStringAsync();
+                            string newToken = ExtractTSoftTokenFromBody(body);
+                            if (!string.IsNullOrWhiteSpace(newToken))
+                            {
+                                PersistTSoftToken(cfg, newToken.Trim());
+                                Log($"TSOFT token yenilendi ({reason}).");
+                                return true;
+                            }
+
+                            TSoftResponse parsed = null;
+                            try { parsed = JsonConvert.DeserializeObject<TSoftResponse>(body); } catch { }
+                            lastErr = BuildTSoftError(parsed);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        lastErr = ex.Message;
+                    }
+                }
+            }
+
+            Log("TSOFT token yenileme başarısız: " + (string.IsNullOrWhiteSpace(lastErr) ? "Auth endpoint token döndürmedi." : lastErr));
+            return false;
+        }
+
+        private async Task EnsureFreshTSoftTokenAsync(TSoftCfg cfg, CancellationToken ct)
+        {
+            if (!HasTSoftAuthCredentials(cfg))
+                return;
+
+            bool refreshNeeded =
+                !cfg.TokenCreatedAtUtc.HasValue ||
+                (DateTime.UtcNow - cfg.TokenCreatedAtUtc.Value).TotalHours >= cfg.RefreshBeforeHours;
+
+            if (refreshNeeded)
+                await TryRefreshTSoftTokenAsync(cfg, ct, "periyodik");
         }
 
         private static string BuildTSoftProductsUrl(string subProductUrl)
@@ -1242,43 +1536,53 @@ namespace XmlToExcel
         private async Task<(Dictionary<string, string> MainCodeByBarcode, HashSet<string> MainCodes)>
             LoadTSoftMainCodeIndexAsync(TSoftCfg cfg, CancellationToken ct)
         {
-            var byBarcode = new Dictionary<string, string>(StringComparer.Ordinal);
-            var mainCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             string url = BuildTSoftProductsUrl(cfg.Url);
 
             using (var http = new HttpClient())
             {
                 http.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
-                using (var content = new FormUrlEncodedContent(new[]
+                for (int attempt = 0; attempt < 2; attempt++)
                 {
-                    new KeyValuePair<string,string>("token", cfg.Token),
-                    new KeyValuePair<string,string>("limit", "1000")
-                }))
-                using (var resp = await http.PostAsync(url, content, ct))
-                {
-                    string body = await resp.Content.ReadAsStringAsync();
-                    if (!resp.IsSuccessStatusCode)
-                        throw new InvalidOperationException("TSOFT ürün listesi alınamadı: " + body);
-
-                    var parsed = JsonConvert.DeserializeObject<TSoftProductsResponse>(body);
-                    if (parsed != null && parsed.success.HasValue && !parsed.success.Value)
+                    using (var content = new FormUrlEncodedContent(new[]
                     {
-                        var err = BuildTSoftError(new TSoftResponse { success = parsed.success, message = parsed.message });
-                        throw new InvalidOperationException("TSOFT ürün listesi hatası: " + err);
-                    }
-
-                    foreach (var p in parsed?.data ?? new List<TSoftProductLite>())
+                        new KeyValuePair<string,string>("token", cfg.Token),
+                        new KeyValuePair<string,string>("limit", "1000")
+                    }))
+                    using (var resp = await http.PostAsync(url, content, ct))
                     {
-                        var main = (p?.ProductCode ?? "").Trim();
-                        var bar = NormalizeBarcode(p?.Barcode ?? "");
-                        if (main.Length == 0) continue;
-                        mainCodes.Add(main);
-                        if (bar.Length > 0) byBarcode[bar] = main;
+                        string body = await resp.Content.ReadAsStringAsync();
+                        var parsed = JsonConvert.DeserializeObject<TSoftProductsResponse>(body);
+                        var parsedAsBase = new TSoftResponse { success = parsed?.success, message = parsed?.message };
+
+                        if (!resp.IsSuccessStatusCode || (parsed != null && parsed.success.HasValue && !parsed.success.Value))
+                        {
+                            if (attempt == 0 && IsTSoftTokenExpired(parsedAsBase, body))
+                            {
+                                bool refreshed = await TryRefreshTSoftTokenAsync(cfg, ct, "ürün index");
+                                if (refreshed) continue;
+                            }
+
+                            var err = BuildTSoftError(parsedAsBase);
+                            throw new InvalidOperationException("TSOFT ürün listesi hatası: " + err);
+                        }
+
+                        var byBarcode = new Dictionary<string, string>(StringComparer.Ordinal);
+                        var mainCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var p in parsed?.data ?? new List<TSoftProductLite>())
+                        {
+                            var main = (p?.ProductCode ?? "").Trim();
+                            var bar = NormalizeBarcode(p?.Barcode ?? "");
+                            if (main.Length == 0) continue;
+                            mainCodes.Add(main);
+                            if (bar.Length > 0) byBarcode[bar] = main;
+                        }
+
+                        return (byBarcode, mainCodes);
                     }
                 }
             }
 
-            return (byBarcode, mainCodes);
+            throw new InvalidOperationException("TSOFT ürün index alınamadı.");
         }
 
         private static IEnumerable<List<TSoftStockPayload>> ChunkTSoftItems(List<TSoftStockPayload> src, int size)
@@ -1291,30 +1595,47 @@ namespace XmlToExcel
         private async Task PostTSoftBatchAsync(HttpClient http, TSoftCfg cfg, List<TSoftStockPayload> batch, CancellationToken ct)
         {
             string dataJson = JsonConvert.SerializeObject(batch);
-            using (var content = new FormUrlEncodedContent(new[]
+            for (int attempt = 0; attempt < 2; attempt++)
             {
-                new KeyValuePair<string,string>("token", cfg.Token),
-                new KeyValuePair<string,string>("data", dataJson)
-            }))
-            using (var resp = await http.PostAsync(cfg.Url, content, ct))
-            {
-                string body = await resp.Content.ReadAsStringAsync();
+                using (var content = new FormUrlEncodedContent(new[]
+                {
+                    new KeyValuePair<string,string>("token", cfg.Token),
+                    new KeyValuePair<string,string>("data", dataJson)
+                }))
+                using (var resp = await http.PostAsync(cfg.Url, content, ct))
+                {
+                    string body = await resp.Content.ReadAsStringAsync();
 
-                if (!resp.IsSuccessStatusCode)
-                    throw new InvalidOperationException(body);
+                    TSoftResponse parsed = null;
+                    try { parsed = JsonConvert.DeserializeObject<TSoftResponse>(body); } catch { }
+                    var errText = BuildTSoftError(parsed);
 
-                TSoftResponse parsed = null;
-                try { parsed = JsonConvert.DeserializeObject<TSoftResponse>(body); } catch { }
+                    if (!resp.IsSuccessStatusCode || (parsed != null && parsed.success.HasValue && !parsed.success.Value))
+                    {
+                        if (attempt == 0 && IsTSoftTokenExpired(parsed, body))
+                        {
+                            bool refreshed = await TryRefreshTSoftTokenAsync(cfg, ct, "stok gönderimi");
+                            if (refreshed) continue;
+                            throw new InvalidOperationException("TSOFT token süresi doldu. tsoft.txt içine AUTH_USER ve AUTH_PASS ekleyin.");
+                        }
 
-                if (parsed != null && parsed.success.HasValue && !parsed.success.Value)
-                    throw new InvalidOperationException(BuildTSoftError(parsed));
+                        if (!string.IsNullOrWhiteSpace(errText) && errText != "Bilinmeyen TSoft hatası")
+                            throw new InvalidOperationException(errText);
+                        throw new InvalidOperationException(body);
+                    }
+
+                    return;
+                }
             }
+
+            throw new InvalidOperationException("TSOFT gönderim tekrar denemeleri tükendi.");
         }
 
         private async Task<int> SendVariantStocksToTSoftAsync(string productsExcelPath, CancellationToken ct)
         {
             string baseDir = FindProjectRoot(AppDomain.CurrentDomain.BaseDirectory);
             var cfg = LoadTSoftConfig(baseDir);
+            await EnsureFreshTSoftTokenAsync(cfg, ct);
             Log($"TSOFT endpoint: {cfg.Url}");
             var xmlToTsoftBarcode = LoadXmlToTSoftBarcodeMap(baseDir);
 
