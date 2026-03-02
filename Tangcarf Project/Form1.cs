@@ -31,6 +31,7 @@ namespace XmlToExcel
         private TextBox txtLog;
 
         // ---------- Timer/State ----------
+        private const string VersionStamp = "v1.0";
         private const int IntervalMinutes = 20;
         private const int IntervalSeconds = IntervalMinutes * 60;
         private readonly WinTimer _uiTimer = new WinTimer();
@@ -64,7 +65,7 @@ namespace XmlToExcel
 
         private void InitUi()
         {
-            Text = "XML → Excel + Eşleme + Trendyol (WinForms)";
+            Text = $"XML → Excel + Eşleme + Trendyol + TSoft ({VersionStamp})";
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new System.Drawing.Size(1000, 600);
 
@@ -100,6 +101,7 @@ namespace XmlToExcel
         {
             _running = true;
             btnStartStop.Text = "Stop";
+            Log("Sürüm damgası: " + VersionStamp);
             Log("Süreç başlatıldı. İlk tur çalışıyor...");
             _cts = new CancellationTokenSource();
             await RunJobAndReportAsync(_cts.Token);
