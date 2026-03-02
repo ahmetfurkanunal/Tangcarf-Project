@@ -1090,6 +1090,19 @@ namespace XmlToExcel
             public List<TSoftMessage> message;
         }
 
+        private sealed class TSoftSubProductLite
+        {
+            public string SubProductCode;
+            public string MainProductCode;
+        }
+
+        private sealed class TSoftSubProductsResponse
+        {
+            public bool? success;
+            public List<TSoftSubProductLite> data;
+            public List<TSoftMessage> message;
+        }
+
         private sealed class TSoftStockPayload
         {
             public string MainProductCode;
@@ -1637,6 +1650,62 @@ namespace XmlToExcel
             return $"{uri.Scheme}://{uri.Host}/rest1/product/getProducts";
         }
 
+        private static string BuildTSoftSubProductsUrl(string subProductUrl)
+        {
+            if (!Uri.TryCreate(subProductUrl ?? "", UriKind.Absolute, out var uri))
+                return "https://tangcarf.tsoft.biz/rest1/subProduct/getSubProducts";
+            return $"{uri.Scheme}://{uri.Host}/rest1/subProduct/getSubProducts";
+        }
+
+        private async Task<Dictionary<string, string>> LoadTSoftSubProductMainMapAsync(TSoftCfg cfg, CancellationToken ct)
+        {
+            string url = BuildTSoftSubProductsUrl(cfg.Url);
+
+            using (var http = new HttpClient())
+            {
+                http.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
+                for (int attempt = 0; attempt < 2; attempt++)
+                {
+                    using (var content = new FormUrlEncodedContent(new[]
+                    {
+                        new KeyValuePair<string,string>("token", cfg.Token),
+                        new KeyValuePair<string,string>("limit", "5000")
+                    }))
+                    using (var resp = await http.PostAsync(url, content, ct))
+                    {
+                        string body = await resp.Content.ReadAsStringAsync();
+                        var parsed = JsonConvert.DeserializeObject<TSoftSubProductsResponse>(body);
+                        var parsedAsBase = new TSoftResponse { success = parsed?.success, message = parsed?.message };
+
+                        if (!resp.IsSuccessStatusCode || (parsed != null && parsed.success.HasValue && !parsed.success.Value))
+                        {
+                            if (attempt == 0 && IsTSoftTokenExpired(parsedAsBase, body))
+                            {
+                                bool refreshed = await TryRefreshTSoftTokenAsync(cfg, ct, "alt ürün index");
+                                if (refreshed) continue;
+                            }
+
+                            var err = BuildTSoftError(parsedAsBase);
+                            throw new InvalidOperationException("TSOFT alt ürün listesi hatası: " + err);
+                        }
+
+                        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var row in parsed?.data ?? new List<TSoftSubProductLite>())
+                        {
+                            var sub = (row?.SubProductCode ?? "").Trim();
+                            var main = (row?.MainProductCode ?? "").Trim();
+                            if (sub.Length == 0 || main.Length == 0) continue;
+                            map[sub] = main;
+                        }
+
+                        return map;
+                    }
+                }
+            }
+
+            throw new InvalidOperationException("TSOFT alt ürün index alınamadı.");
+        }
+
         private static Dictionary<string, string> LoadXmlToTSoftBarcodeMap(string baseDir)
         {
             var map = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -1782,6 +1851,17 @@ namespace XmlToExcel
             Log($"TSOFT endpoint: {cfg.Url}");
             var xmlToTsoftBarcode = LoadXmlToTSoftBarcodeMap(baseDir);
 
+            var mainBySubCode = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                mainBySubCode = await LoadTSoftSubProductMainMapAsync(cfg, ct);
+                Log($"TSOFT alt ürün index yüklendi: {mainBySubCode.Count}");
+            }
+            catch (Exception ex)
+            {
+                Log("TSOFT alt ürün index uyarı: " + ex.Message + (ex.InnerException != null ? " | " + ex.InnerException.Message : ""));
+            }
+
             var mainByBarcode = new Dictionary<string, string>(StringComparer.Ordinal);
             var validMainCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
@@ -1793,12 +1873,13 @@ namespace XmlToExcel
             }
             catch (Exception ex)
             {
-                Log("TSOFT ürün index uyarı: " + ex.Message);
+                Log("TSOFT ürün index uyarı: " + ex.Message + (ex.InnerException != null ? " | " + ex.InnerException.Message : ""));
             }
 
             var stockByPair = new Dictionary<string, TSoftStockPayload>(StringComparer.OrdinalIgnoreCase);
             int skippedMainCode = 0;
             int skippedSubCode = 0;
+            int mainResolvedBySubCode = 0;
             int mainResolvedByBarcode = 0;
             int mainResolvedDirect = 0;
 
@@ -1835,7 +1916,7 @@ namespace XmlToExcel
                         colBarcodes = c;
                 }
 
-                if (colSku == 0 || colStock == 0 || (colMain == 0 && colBarcodes == 0))
+                if (colSku == 0 || colStock == 0 || (colMain == 0 && colBarcodes == 0 && mainBySubCode.Count == 0))
                     throw new Exception("Variant.Sku, Variant.Stock.Total ve (Product.Id veya Variant.Barcodes) sütunları bulunamadı");
 
                 int lastRow = ws.LastRowUsed()?.RowNumber() ?? headerRow;
@@ -1847,9 +1928,24 @@ namespace XmlToExcel
                     string rawBarcodes = colBarcodes > 0 ? ws.Cell(r, colBarcodes).GetString() : "";
 
                     string resolvedMainCode = "";
-                    if (mainCode.Length > 0)
+                    if (subCode.Length > 0 && mainBySubCode.TryGetValue(subCode, out var mainFromSub) && !string.IsNullOrWhiteSpace(mainFromSub))
                     {
-                        if (validMainCodes.Count == 0 || validMainCodes.Contains(mainCode))
+                        resolvedMainCode = mainFromSub.Trim();
+                        mainResolvedBySubCode++;
+                    }
+
+                    bool hasAnyRemoteIndex = mainBySubCode.Count > 0 || validMainCodes.Count > 0 || mainByBarcode.Count > 0;
+                    if (resolvedMainCode.Length == 0 && mainCode.Length > 0)
+                    {
+                        if (validMainCodes.Count > 0)
+                        {
+                            if (validMainCodes.Contains(mainCode))
+                            {
+                                resolvedMainCode = mainCode;
+                                mainResolvedDirect++;
+                            }
+                        }
+                        else if (!hasAnyRemoteIndex)
                         {
                             resolvedMainCode = mainCode;
                             mainResolvedDirect++;
@@ -1900,7 +1996,7 @@ namespace XmlToExcel
 
             var items = stockByPair.Values.ToList();
 
-            Log($"TSOFT gönderilecek ürün: {items.Count} (MainProductCode çözülen: direkt={mainResolvedDirect}, barkod={mainResolvedByBarcode}, atlanan={skippedMainCode}; SubProductCode boş atlanan: {skippedSubCode})");
+            Log($"TSOFT gönderilecek ürün: {items.Count} (MainProductCode çözülen: subcode={mainResolvedBySubCode}, direkt={mainResolvedDirect}, barkod={mainResolvedByBarcode}, atlanan={skippedMainCode}; SubProductCode boş atlanan: {skippedSubCode})");
 
             if (items.Count == 0)
             {
