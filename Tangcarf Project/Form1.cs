@@ -1375,6 +1375,63 @@ namespace XmlToExcel
             return candidate.TrimEnd('/') + "/auth/login/" + userEsc;
         }
 
+        private static IEnumerable<string> GetTSoftAuthUserCandidates(string authUser)
+        {
+            var list = new List<string>();
+            var u = (authUser ?? "").Trim();
+            if (u.Length == 0) return list;
+
+            list.Add(u);
+            int at = u.IndexOf('@');
+            if (at > 0) list.Add(u.Substring(0, at));
+
+            return list.Distinct(StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static List<string> BuildTSoftAuthLoginUrlCandidates(TSoftCfg cfg)
+        {
+            var urls = new List<string>();
+            var users = GetTSoftAuthUserCandidates(cfg?.AuthUser).ToList();
+            if (users.Count == 0) return urls;
+
+            string primary = BuildTSoftAuthLoginUrl(cfg);
+            if (!string.IsNullOrWhiteSpace(primary))
+                urls.Add(primary);
+
+            if (Uri.TryCreate(cfg?.Url ?? "", UriKind.Absolute, out var endpointUri))
+            {
+                string baseLogin = $"{endpointUri.Scheme}://{endpointUri.Host}/rest1/auth/login";
+                foreach (var u in users)
+                {
+                    urls.Add(baseLogin + "/" + Uri.EscapeDataString(u));
+                    urls.Add(baseLogin + "/" + u);
+                }
+            }
+
+            var expanded = new List<string>();
+            foreach (var u in users)
+            {
+                string esc = Uri.EscapeDataString(u);
+                foreach (var url in urls)
+                {
+                    if (url.IndexOf("{user}", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        expanded.Add(Regex.Replace(url, "\\{user\\}", esc, RegexOptions.IgnoreCase));
+                        expanded.Add(Regex.Replace(url, "\\{user\\}", u, RegexOptions.IgnoreCase));
+                    }
+                    else
+                    {
+                        expanded.Add(url);
+                    }
+                }
+            }
+
+            return expanded
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
         private static void UpsertConfigLine(List<string> lines, string key, string value)
         {
             for (int i = 0; i < lines.Count; i++)
@@ -1417,6 +1474,23 @@ namespace XmlToExcel
             catch { }
         }
 
+        private static void PersistTSoftTokenMetadata(TSoftCfg cfg)
+        {
+            if (string.IsNullOrWhiteSpace(cfg?.ConfigPath))
+                return;
+
+            try
+            {
+                var lines = File.Exists(cfg.ConfigPath)
+                    ? File.ReadAllLines(cfg.ConfigPath, Encoding.UTF8).ToList()
+                    : new List<string>();
+
+                UpsertConfigLine(lines, "TOKEN_CREATED_AT_UTC", DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture));
+                File.WriteAllLines(cfg.ConfigPath, lines, new UTF8Encoding(true));
+            }
+            catch { }
+        }
+
         private async Task<bool> TryRefreshTSoftTokenAsync(TSoftCfg cfg, CancellationToken ct, string reason)
         {
             if (!HasTSoftAuthCredentials(cfg))
@@ -1425,7 +1499,13 @@ namespace XmlToExcel
                 return false;
             }
 
-            string loginUrl = BuildTSoftAuthLoginUrl(cfg);
+            var loginUrls = BuildTSoftAuthLoginUrlCandidates(cfg);
+            if (loginUrls.Count == 0)
+            {
+                Log("TSOFT token yenileme atlandı: auth kullanıcı adı boş.");
+                return false;
+            }
+
             string lastErr = "";
 
             var payloads = new List<Dictionary<string, string>>
@@ -1441,13 +1521,72 @@ namespace XmlToExcel
             {
                 http.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
 
-                foreach (var form in payloads)
+                foreach (var loginUrl in loginUrls)
                 {
-                    ct.ThrowIfCancellationRequested();
+                    foreach (var form in payloads)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        try
+                        {
+                            using (var content = new FormUrlEncodedContent(form))
+                            using (var resp = await http.PostAsync(loginUrl, content, ct))
+                            {
+                                string body = await resp.Content.ReadAsStringAsync();
+                                string newToken = ExtractTSoftTokenFromBody(body);
+                                if (!string.IsNullOrWhiteSpace(newToken))
+                                {
+                                    PersistTSoftToken(cfg, newToken.Trim());
+                                    Log($"TSOFT token yenilendi ({reason}).");
+                                    return true;
+                                }
+
+                                TSoftResponse parsed = null;
+                                try { parsed = JsonConvert.DeserializeObject<TSoftResponse>(body); } catch { }
+                                lastErr = BuildTSoftError(parsed);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            lastErr = ex.Message;
+                        }
+                    }
+
+                    foreach (var key in new[] { "pass", "password", "sifre", "pwd" })
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        try
+                        {
+                            string sep = loginUrl.IndexOf('?') >= 0 ? "&" : "?";
+                            string loginWithQuery = loginUrl + sep + key + "=" + Uri.EscapeDataString(cfg.AuthPass ?? "");
+
+                            using (var content = new FormUrlEncodedContent(new KeyValuePair<string, string>[0]))
+                            using (var resp = await http.PostAsync(loginWithQuery, content, ct))
+                            {
+                                string body = await resp.Content.ReadAsStringAsync();
+                                string newToken = ExtractTSoftTokenFromBody(body);
+                                if (!string.IsNullOrWhiteSpace(newToken))
+                                {
+                                    PersistTSoftToken(cfg, newToken.Trim());
+                                    Log($"TSOFT token yenilendi ({reason}).");
+                                    return true;
+                                }
+
+                                TSoftResponse parsed = null;
+                                try { parsed = JsonConvert.DeserializeObject<TSoftResponse>(body); } catch { }
+                                lastErr = BuildTSoftError(parsed);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            lastErr = ex.Message;
+                        }
+                    }
+
                     try
                     {
-                        using (var content = new FormUrlEncodedContent(form))
-                        using (var resp = await http.PostAsync(loginUrl, content, ct))
+                        string loginWithPathPass = loginUrl.TrimEnd('/') + "/" + Uri.EscapeDataString(cfg.AuthPass ?? "");
+                        using (var content = new FormUrlEncodedContent(new KeyValuePair<string, string>[0]))
+                        using (var resp = await http.PostAsync(loginWithPathPass, content, ct))
                         {
                             string body = await resp.Content.ReadAsStringAsync();
                             string newToken = ExtractTSoftTokenFromBody(body);
@@ -1457,10 +1596,6 @@ namespace XmlToExcel
                                 Log($"TSOFT token yenilendi ({reason}).");
                                 return true;
                             }
-
-                            TSoftResponse parsed = null;
-                            try { parsed = JsonConvert.DeserializeObject<TSoftResponse>(body); } catch { }
-                            lastErr = BuildTSoftError(parsed);
                         }
                     }
                     catch (Exception ex)
@@ -1478,6 +1613,14 @@ namespace XmlToExcel
         {
             if (!HasTSoftAuthCredentials(cfg))
                 return;
+
+            if (!cfg.TokenCreatedAtUtc.HasValue && !string.IsNullOrWhiteSpace(cfg.Token))
+            {
+                cfg.TokenCreatedAtUtc = DateTime.UtcNow;
+                PersistTSoftTokenMetadata(cfg);
+                Log("TSOFT token zaman damgası oluşturuldu.");
+                return;
+            }
 
             bool refreshNeeded =
                 !cfg.TokenCreatedAtUtc.HasValue ||
