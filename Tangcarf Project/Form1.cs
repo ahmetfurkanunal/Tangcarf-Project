@@ -1514,21 +1514,16 @@ namespace XmlToExcel
             catch { }
         }
 
-        private static void PersistTSoftTokenMetadata(TSoftCfg cfg)
+        private bool ApplyTSoftTokenFromAuth(TSoftCfg cfg, string newToken, string reason)
         {
-            if (string.IsNullOrWhiteSpace(cfg?.ConfigPath))
-                return;
-
-            try
-            {
-                var lines = File.Exists(cfg.ConfigPath)
-                    ? File.ReadAllLines(cfg.ConfigPath, Encoding.UTF8).ToList()
-                    : new List<string>();
-
-                UpsertConfigLine(lines, "TOKEN_CREATED_AT_UTC", DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture));
-                File.WriteAllLines(cfg.ConfigPath, lines, new UTF8Encoding(true));
-            }
-            catch { }
+            if (string.IsNullOrWhiteSpace(newToken)) return false;
+            var token = newToken.Trim();
+            bool changed = !string.Equals((cfg.Token ?? "").Trim(), token, StringComparison.Ordinal);
+            PersistTSoftToken(cfg, token);
+            Log(changed
+                ? $"TSOFT token yenilendi ({reason})."
+                : $"TSOFT token doğrulandı ({reason}), değişiklik yok.");
+            return true;
         }
 
         private async Task<bool> TryRefreshTSoftTokenAsync(TSoftCfg cfg, CancellationToken ct, string reason)
@@ -1581,12 +1576,8 @@ namespace XmlToExcel
                                 {
                                     string body = await resp.Content.ReadAsStringAsync();
                                     string newToken = ExtractTSoftTokenFromBody(body);
-                                    if (!string.IsNullOrWhiteSpace(newToken))
-                                    {
-                                        PersistTSoftToken(cfg, newToken.Trim());
-                                        Log($"TSOFT token yenilendi ({reason}).");
+                                    if (ApplyTSoftTokenFromAuth(cfg, newToken, reason))
                                         return true;
-                                    }
 
                                     TSoftResponse parsed = null;
                                     try { parsed = JsonConvert.DeserializeObject<TSoftResponse>(body); } catch { }
@@ -1612,12 +1603,8 @@ namespace XmlToExcel
                                 {
                                     string body = await resp.Content.ReadAsStringAsync();
                                     string newToken = ExtractTSoftTokenFromBody(body);
-                                    if (!string.IsNullOrWhiteSpace(newToken))
-                                    {
-                                        PersistTSoftToken(cfg, newToken.Trim());
-                                        Log($"TSOFT token yenilendi ({reason}).");
+                                    if (ApplyTSoftTokenFromAuth(cfg, newToken, reason))
                                         return true;
-                                    }
 
                                     TSoftResponse parsed = null;
                                     try { parsed = JsonConvert.DeserializeObject<TSoftResponse>(body); } catch { }
@@ -1638,12 +1625,8 @@ namespace XmlToExcel
                             {
                                 string body = await resp.Content.ReadAsStringAsync();
                                 string newToken = ExtractTSoftTokenFromBody(body);
-                                if (!string.IsNullOrWhiteSpace(newToken))
-                                {
-                                    PersistTSoftToken(cfg, newToken.Trim());
-                                    Log($"TSOFT token yenilendi ({reason}).");
+                                if (ApplyTSoftTokenFromAuth(cfg, newToken, reason))
                                     return true;
-                                }
                             }
                         }
                         catch (Exception ex)
@@ -1662,21 +1645,8 @@ namespace XmlToExcel
         {
             if (!HasTSoftAuthCredentials(cfg))
                 return;
-
-            if (!cfg.TokenCreatedAtUtc.HasValue && !string.IsNullOrWhiteSpace(cfg.Token))
-            {
-                cfg.TokenCreatedAtUtc = DateTime.UtcNow;
-                PersistTSoftTokenMetadata(cfg);
-                Log("TSOFT token zaman damgası oluşturuldu.");
-                return;
-            }
-
-            bool refreshNeeded =
-                !cfg.TokenCreatedAtUtc.HasValue ||
-                (DateTime.UtcNow - cfg.TokenCreatedAtUtc.Value).TotalHours >= cfg.RefreshBeforeHours;
-
-            if (refreshNeeded)
-                await TryRefreshTSoftTokenAsync(cfg, ct, "periyodik");
+            // Her 20 dakikalık turda tokenı auth endpoint'ten doğrula/senkronla.
+            await TryRefreshTSoftTokenAsync(cfg, ct, "20dk kontrol");
         }
 
         private static string BuildTSoftProductsUrl(string subProductUrl)
