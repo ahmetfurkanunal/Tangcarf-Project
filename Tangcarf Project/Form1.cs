@@ -1666,50 +1666,73 @@ namespace XmlToExcel
         private async Task<Dictionary<string, string>> LoadTSoftSubProductMainMapAsync(TSoftCfg cfg, CancellationToken ct)
         {
             string url = BuildTSoftSubProductsUrl(cfg.Url);
+            string lastErr = "";
+            int[] limits = new[] { 5000, 2000, 1000, 500, 200 };
 
-            using (var http = new HttpClient())
+            using (var handler = new HttpClientHandler
+            { AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate })
+            using (var http = new HttpClient(handler))
             {
                 http.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
-                for (int attempt = 0; attempt < 2; attempt++)
+                foreach (var limit in limits)
                 {
-                    using (var content = new FormUrlEncodedContent(new[]
+                    for (int attempt = 0; attempt < 2; attempt++)
                     {
-                        new KeyValuePair<string,string>("token", cfg.Token),
-                        new KeyValuePair<string,string>("limit", "5000")
-                    }))
-                    using (var resp = await http.PostAsync(url, content, ct))
-                    {
-                        string body = await resp.Content.ReadAsStringAsync();
-                        var parsed = JsonConvert.DeserializeObject<TSoftSubProductsResponse>(body);
-                        var parsedAsBase = new TSoftResponse { success = parsed?.success, message = parsed?.message };
-
-                        if (!resp.IsSuccessStatusCode || (parsed != null && parsed.success.HasValue && !parsed.success.Value))
+                        try
                         {
-                            if (attempt == 0 && IsTSoftTokenExpired(parsedAsBase, body))
+                            using (var content = new FormUrlEncodedContent(new[]
                             {
-                                bool refreshed = await TryRefreshTSoftTokenAsync(cfg, ct, "alt ürün index");
-                                if (refreshed) continue;
+                                new KeyValuePair<string,string>("token", cfg.Token),
+                                new KeyValuePair<string,string>("limit", limit.ToString(CultureInfo.InvariantCulture))
+                            }))
+                            using (var resp = await http.PostAsync(url, content, ct))
+                            {
+                                string body = await resp.Content.ReadAsStringAsync();
+                                var parsed = JsonConvert.DeserializeObject<TSoftSubProductsResponse>(body);
+                                var parsedAsBase = new TSoftResponse { success = parsed?.success, message = parsed?.message };
+
+                                if (!resp.IsSuccessStatusCode || (parsed != null && parsed.success.HasValue && !parsed.success.Value))
+                                {
+                                    if (attempt == 0 && IsTSoftTokenExpired(parsedAsBase, body))
+                                    {
+                                        bool refreshed = await TryRefreshTSoftTokenAsync(cfg, ct, "alt ürün index");
+                                        if (refreshed) continue;
+                                    }
+
+                                    var err = BuildTSoftError(parsedAsBase);
+                                    if (!string.IsNullOrWhiteSpace(err) && err != "Bilinmeyen TSoft hatası")
+                                        throw new InvalidOperationException("TSOFT alt ürün listesi hatası: " + err);
+                                    throw new InvalidOperationException("TSOFT alt ürün listesi hatası: " + body);
+                                }
+
+                                var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                                foreach (var row in parsed?.data ?? new List<TSoftSubProductLite>())
+                                {
+                                    var sub = (row?.SubProductCode ?? "").Trim();
+                                    var main = (row?.MainProductCode ?? "").Trim();
+                                    if (sub.Length == 0 || main.Length == 0) continue;
+                                    map[sub] = main;
+                                }
+
+                                return map;
                             }
-
-                            var err = BuildTSoftError(parsedAsBase);
-                            throw new InvalidOperationException("TSOFT alt ürün listesi hatası: " + err);
                         }
-
-                        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                        foreach (var row in parsed?.data ?? new List<TSoftSubProductLite>())
+                        catch (Exception ex) when (attempt == 0)
                         {
-                            var sub = (row?.SubProductCode ?? "").Trim();
-                            var main = (row?.MainProductCode ?? "").Trim();
-                            if (sub.Length == 0 || main.Length == 0) continue;
-                            map[sub] = main;
+                            lastErr = ex.Message;
+                            await Task.Delay(250, ct);
+                            continue;
                         }
-
-                        return map;
+                        catch (Exception ex)
+                        {
+                            lastErr = ex.Message;
+                            break;
+                        }
                     }
                 }
             }
 
-            throw new InvalidOperationException("TSOFT alt ürün index alınamadı.");
+            throw new InvalidOperationException("TSOFT alt ürün index alınamadı: " + lastErr);
         }
 
         private static Dictionary<string, string> LoadXmlToTSoftBarcodeMap(string baseDir)
@@ -1755,52 +1778,75 @@ namespace XmlToExcel
             LoadTSoftMainCodeIndexAsync(TSoftCfg cfg, CancellationToken ct)
         {
             string url = BuildTSoftProductsUrl(cfg.Url);
+            string lastErr = "";
+            int[] limits = new[] { 1000, 500, 200, 100 };
 
-            using (var http = new HttpClient())
+            using (var handler = new HttpClientHandler
+            { AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate })
+            using (var http = new HttpClient(handler))
             {
                 http.Timeout = TimeSpan.FromSeconds(cfg.TimeoutSeconds);
-                for (int attempt = 0; attempt < 2; attempt++)
+                foreach (var limit in limits)
                 {
-                    using (var content = new FormUrlEncodedContent(new[]
+                    for (int attempt = 0; attempt < 2; attempt++)
                     {
-                        new KeyValuePair<string,string>("token", cfg.Token),
-                        new KeyValuePair<string,string>("limit", "1000")
-                    }))
-                    using (var resp = await http.PostAsync(url, content, ct))
-                    {
-                        string body = await resp.Content.ReadAsStringAsync();
-                        var parsed = JsonConvert.DeserializeObject<TSoftProductsResponse>(body);
-                        var parsedAsBase = new TSoftResponse { success = parsed?.success, message = parsed?.message };
-
-                        if (!resp.IsSuccessStatusCode || (parsed != null && parsed.success.HasValue && !parsed.success.Value))
+                        try
                         {
-                            if (attempt == 0 && IsTSoftTokenExpired(parsedAsBase, body))
+                            using (var content = new FormUrlEncodedContent(new[]
                             {
-                                bool refreshed = await TryRefreshTSoftTokenAsync(cfg, ct, "ürün index");
-                                if (refreshed) continue;
+                                new KeyValuePair<string,string>("token", cfg.Token),
+                                new KeyValuePair<string,string>("limit", limit.ToString(CultureInfo.InvariantCulture))
+                            }))
+                            using (var resp = await http.PostAsync(url, content, ct))
+                            {
+                                string body = await resp.Content.ReadAsStringAsync();
+                                var parsed = JsonConvert.DeserializeObject<TSoftProductsResponse>(body);
+                                var parsedAsBase = new TSoftResponse { success = parsed?.success, message = parsed?.message };
+
+                                if (!resp.IsSuccessStatusCode || (parsed != null && parsed.success.HasValue && !parsed.success.Value))
+                                {
+                                    if (attempt == 0 && IsTSoftTokenExpired(parsedAsBase, body))
+                                    {
+                                        bool refreshed = await TryRefreshTSoftTokenAsync(cfg, ct, "ürün index");
+                                        if (refreshed) continue;
+                                    }
+
+                                    var err = BuildTSoftError(parsedAsBase);
+                                    if (!string.IsNullOrWhiteSpace(err) && err != "Bilinmeyen TSoft hatası")
+                                        throw new InvalidOperationException("TSOFT ürün listesi hatası: " + err);
+                                    throw new InvalidOperationException("TSOFT ürün listesi hatası: " + body);
+                                }
+
+                                var byBarcode = new Dictionary<string, string>(StringComparer.Ordinal);
+                                var mainCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                                foreach (var p in parsed?.data ?? new List<TSoftProductLite>())
+                                {
+                                    var main = (p?.ProductCode ?? "").Trim();
+                                    var bar = NormalizeBarcode(p?.Barcode ?? "");
+                                    if (main.Length == 0) continue;
+                                    mainCodes.Add(main);
+                                    if (bar.Length > 0) byBarcode[bar] = main;
+                                }
+
+                                return (byBarcode, mainCodes);
                             }
-
-                            var err = BuildTSoftError(parsedAsBase);
-                            throw new InvalidOperationException("TSOFT ürün listesi hatası: " + err);
                         }
-
-                        var byBarcode = new Dictionary<string, string>(StringComparer.Ordinal);
-                        var mainCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                        foreach (var p in parsed?.data ?? new List<TSoftProductLite>())
+                        catch (Exception ex) when (attempt == 0)
                         {
-                            var main = (p?.ProductCode ?? "").Trim();
-                            var bar = NormalizeBarcode(p?.Barcode ?? "");
-                            if (main.Length == 0) continue;
-                            mainCodes.Add(main);
-                            if (bar.Length > 0) byBarcode[bar] = main;
+                            lastErr = ex.Message;
+                            await Task.Delay(250, ct);
+                            continue;
                         }
-
-                        return (byBarcode, mainCodes);
+                        catch (Exception ex)
+                        {
+                            lastErr = ex.Message;
+                            break;
+                        }
                     }
                 }
             }
 
-            throw new InvalidOperationException("TSOFT ürün index alınamadı.");
+            throw new InvalidOperationException("TSOFT ürün index alınamadı: " + lastErr);
         }
 
         private static IEnumerable<List<TSoftStockPayload>> ChunkTSoftItems(List<TSoftStockPayload> src, int size)
@@ -1882,6 +1928,12 @@ namespace XmlToExcel
                 Log("TSOFT ürün index uyarı: " + ex.Message + (ex.InnerException != null ? " | " + ex.InnerException.Message : ""));
             }
 
+            if (mainBySubCode.Count == 0 && validMainCodes.Count == 0 && mainByBarcode.Count == 0)
+            {
+                Log("TSOFT index alınamadı. Hatalı MainProductCode riskine karşı gönderim atlandı.");
+                return 0;
+            }
+
             var stockByPair = new Dictionary<string, TSoftStockPayload>(StringComparer.OrdinalIgnoreCase);
             int skippedMainCode = 0;
             int skippedSubCode = 0;
@@ -1940,7 +1992,6 @@ namespace XmlToExcel
                         mainResolvedBySubCode++;
                     }
 
-                    bool hasAnyRemoteIndex = mainBySubCode.Count > 0 || validMainCodes.Count > 0 || mainByBarcode.Count > 0;
                     if (resolvedMainCode.Length == 0 && mainCode.Length > 0)
                     {
                         if (validMainCodes.Count > 0)
@@ -1950,11 +2001,6 @@ namespace XmlToExcel
                                 resolvedMainCode = mainCode;
                                 mainResolvedDirect++;
                             }
-                        }
-                        else if (!hasAnyRemoteIndex)
-                        {
-                            resolvedMainCode = mainCode;
-                            mainResolvedDirect++;
                         }
                     }
 
